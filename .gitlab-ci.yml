@@ -1,0 +1,41 @@
+stages:
+  - test
+  - release
+
+variables:
+  PROJECT_NAME: rmqrpc
+  GITLAB_BRANCH: $CI_COMMIT_BRANCH
+
+test_application:
+  image: golang:latest
+  stage: test
+  tags:
+    - default-runner
+  script:
+    - go mod download
+    - go test ./... -v -timeout 30s -count=1
+    - go vet ./...
+    - go fmt ./...
+    - go install golang.org/x/tools/cmd/goimports@latest
+    - goimports -d .
+  only:
+    - merge_requests
+
+create_new_release:
+  image: golang:latest
+  stage: release
+  tags:
+    - default-runner
+  variables:
+    TAG: $CI_COMMIT_TAG
+    DOCKER_APP_IMAGE: ce-assistant/$PROJECT_NAME
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - go mod download
+    - go test ./... -v -timeout 30s -count=1
+    - go vet ./...
+    - go fmt ./...
+    - go install golang.org/x/tools/cmd/goimports@latest
+    - goimports -d .
+
