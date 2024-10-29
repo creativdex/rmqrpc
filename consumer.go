@@ -3,6 +3,7 @@ package rmqrpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -10,81 +11,47 @@ import (
 )
 
 type Consumer struct {
-	Id       string
-	channel  *amqp.Channel
-	queue    *amqp.Queue
-	messages *<-chan amqp.Delivery
-	router   map[string]func(ctx context.Context, delivery *Message)
-	client   *Server
-	log      *CustomLog
+	Id        string
+	queueName string
+	channel   *amqp.Channel
+	queue     *amqp.Queue
+	messages  *<-chan amqp.Delivery
+	router    map[string]func(ctx context.Context, delivery *Message)
+	client    *Server
+	stopChan  chan struct{}
 }
 
 func newConsumer(queue string, server *Server) *Consumer {
-	customLogger := NewCustomLog("AMQP Consumer")
-	if server.Connection.IsClosed() {
-		customLogger.Error("Connection is closed, cannot open a channel", nil)
-	}
-	ch, err := server.Connection.Channel()
-	if err != nil {
-		customLogger.Error("Error get channel", err)
-		panic(err)
-	}
-
-	q, err := ch.QueueDeclare(
-		queue,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		customLogger.Error("Error queue declare", err)
-		panic(err)
-	}
-
-	err = ch.Qos(
-		1,
-		0,
-		false,
-	)
-	if err != nil {
-		customLogger.Error("Failed to set QoS", err)
-		panic(err)
-	}
-
-	messages, err := ch.Consume(
-		q.Name,
-		"",
-		false,
-		false,
-		false,
-		false,
-		nil,
-	)
-	if err != nil {
-		customLogger.Error("Error listen channel", err)
-		panic(err)
-	}
-
 	return &Consumer{
-		Id:       uuid.New().String(),
-		channel:  ch,
-		queue:    &q,
-		messages: &messages,
-		router:   make(map[string]func(ctx context.Context, delivery *Message)),
-		client:   server,
-		log:      customLogger,
+		Id:        uuid.New().String(),
+		queueName: queue,
+		router:    make(map[string]func(ctx context.Context, delivery *Message)),
+		client:    server,
 	}
 }
 
 func (cons *Consumer) handleMessages() {
-	for d := range *cons.messages {
-		cons.log.Info("Received message", nil)
-		msg := cons.makeMessage(&d)
-		cons.handle(&msg)
+	for {
+		select {
+		case d, ok := <-*cons.messages:
+			if !ok {
+				fmt.Println("Channel messages closed, stopping handle")
+				return
+			}
+
+			if len(d.Body) == 0 {
+				fmt.Println("Received empty message, skipping")
+				d.Ack(false)
+				continue
+			}
+
+			msg := cons.makeMessage(&d)
+			cons.handle(&msg)
+		case <-cons.stopChan:
+			fmt.Println("Received stop signal, stopping handle")
+			return
+		}
 	}
-	cons.log.Info("Channel closed", nil)
 }
 
 func (cons *Consumer) writeMessage(msg *Message, payload []byte) {
@@ -99,28 +66,27 @@ func (cons *Consumer) writeMessage(msg *Message, payload []byte) {
 			Body:          payload,
 		})
 	if err != nil {
-		cons.log.Error("Error publish message", err)
+		fmt.Println("Error publish message:", err)
 		return
 	}
-
-	msg.delivery.Ack(false)
 }
 
 func (cons *Consumer) handle(msg *Message) {
+
 	ctx := context.Background()
 	var req MessageReqEvent[any]
-
 	err := json.Unmarshal(msg.delivery.Body, &req)
 	if err != nil {
-		cons.log.Error("Error unmarshal request", err)
+		fmt.Println("Error unmarshal request:", err)
 		msg.SendError(http.StatusUnprocessableEntity, "Error unmarshal request", "UnprocessableEntity")
 		return
 	}
 
+	fmt.Println("Received request:", req.Data.Subject)
 	handler := cons.router[req.Data.Subject]
 
 	if handler == nil {
-		cons.log.Error("Not found route pattern", req.Data.Subject)
+		fmt.Println("Not found route pattern:", req.Data.Subject)
 		msg.SendError(http.StatusNotFound, "Subject method not found", "NotFound")
 		return
 	}
@@ -132,25 +98,91 @@ func (cons *Consumer) handle(msg *Message) {
 
 func (c *Consumer) makeMessage(msg *amqp.Delivery) Message {
 	return Message{
-		consumer: c,
-		delivery: msg,
+		consumer:  c,
+		delivery:  msg,
+		NeedReply: msg.ReplyTo != "",
 	}
 }
 
 func (cons *Consumer) RegisterRoute(pattern string, handler func(ctx context.Context, delivery *Message)) {
 	cons.router[pattern] = handler
-	cons.log.Info("Register pattern method", pattern)
+	fmt.Println("Register pattern method:", pattern)
 }
 
 func (cons *Consumer) Start() {
+
+	if cons.client.Connection.IsClosed() {
+		fmt.Println("Connection is closed, cannot open a channel")
+	}
+	ch, err := cons.client.Connection.Channel()
+	if err != nil {
+		fmt.Println("Error get channel:", err)
+		panic(err)
+	}
+
+	q, err := ch.QueueDeclare(
+		cons.queueName,
+		true,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		fmt.Println("Error queue declare:", err)
+		panic(err)
+	}
+
+	err = ch.Qos(
+		1,
+		0,
+		false,
+	)
+	if err != nil {
+		fmt.Println("Failed to set QoS:", err)
+		panic(err)
+	}
+
+	messages, err := ch.Consume(
+		q.Name,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+	if err != nil {
+		fmt.Println("Error listen channel:", err)
+		panic(err)
+	}
+
+	cons.channel = ch
+	cons.queue = &q
+	cons.messages = &messages
+
+	cons.stopChan = make(chan struct{})
 	go cons.handleMessages()
 }
 
 func (cons *Consumer) Close() {
-	err := cons.channel.Close()
-	if err != nil {
-		cons.log.Error("Error close channel", err)
-	}
+	cons.Stop()
 	delete(cons.client.Consumers, cons.Id)
-	cons.log.Info("Channel closed", nil)
+	fmt.Println("Consumer closed and deleted")
+}
+
+func (cons *Consumer) Stop() {
+	close(cons.stopChan)
+
+	if cons.channel != nil && !cons.channel.IsClosed() {
+		err := cons.channel.Close()
+		if err != nil {
+			fmt.Println("Error closing channel:", err)
+		}
+		fmt.Println("Channel closed")
+	} else {
+		fmt.Println("Channel already closed")
+	}
+
+	fmt.Println("Consumer stopped")
 }

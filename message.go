@@ -2,16 +2,18 @@ package rmqrpc
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/go-playground/validator/v10"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
 type Message struct {
-	consumer *Consumer
-	delivery *amqp.Delivery
-	payload  any
-	ack      bool
+	consumer  *Consumer
+	delivery  *amqp.Delivery
+	payload   any
+	NeedReply bool
+	ack       bool
 }
 
 func (msg *Message) SendResponse(payload any) {
@@ -25,16 +27,15 @@ func (msg *Message) SendResponse(payload any) {
 
 	pb, err := json.Marshal(message)
 	if err != nil {
-		msg.consumer.log.Error("Error marshal payload", err)
+		fmt.Println("Error marshal payload:", err)
 		pb = []byte(`{"status": "500", "error": "internal server error"}`)
 	}
 
-	msg.consumer.writeMessage(msg, pb)
-
-	if !msg.ack {
-		msg.delivery.Ack(false)
-		msg.ack = true
+	if msg.NeedReply {
+		msg.consumer.writeMessage(msg, pb)
 	}
+
+	msg.Ack()
 }
 
 func (msg *Message) SendError(statusCode int, text string, name string) {
@@ -52,16 +53,16 @@ func (msg *Message) SendError(statusCode int, text string, name string) {
 
 	pb, err := json.Marshal(message)
 	if err != nil {
-		msg.consumer.log.Error("Error marshal payload", err)
+		fmt.Println("Error marshal payload:", err)
 		pb = []byte(`{"status": "500", "error": "internal server error"}`)
 	}
 
-	msg.consumer.writeMessage(msg, pb)
-
-	if !msg.ack {
-		msg.delivery.Ack(false)
-		msg.ack = true
+	if msg.NeedReply {
+		msg.consumer.writeMessage(msg, pb)
 	}
+
+	msg.Ack()
+
 }
 
 func (msg *Message) Ack() bool {
